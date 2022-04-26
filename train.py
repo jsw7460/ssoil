@@ -2,6 +2,7 @@ import gym
 from delimg import DeliMGMSE, DeliMGMLE
 import argparse
 from eval import evaluate_deli
+import tensorboard
 import d4rl
 
 
@@ -42,11 +43,21 @@ if __name__ == "__main__":
     elif args.algo == "mle":
         algo = DeliMGMLE
 
-    model = algo(env, seed=args.seed)
+    filename_head = f"/workspace/jaxlog/"
+    filename_tail = f"{args.env_name}/" \
+                    f"{args.algo}" \
+                    f"-grad{int(args.flow)}" \
+                    f"-seed{args.seed}"
+
+    tensorboard_log = filename_head + "tensorboard/" + filename_tail
+
+    model = algo(env, seed=args.seed, grad_flow=args.flow, tensorboard_log=tensorboard_log)
     expert_data_path = f"/workspace/expertdata/dttrajectory/{args.env_name}"
+
     model.load_data(expert_data_path)
+
     for i in range(200):
         model.learn(total_timesteps=5000, batch_size=256)
-        returns, _ = evaluate_deli(seed=args.seed, env=env, model=model, n_eval_episodes=1, deterministic=True)
+        returns, _ = evaluate_deli(seed=args.seed, env=env, model=model, n_eval_episodes=10, deterministic=True)
         model.diagnostics["evaluations/rewards"].append(returns)
         model._dump_logs()

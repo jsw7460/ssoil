@@ -15,11 +15,12 @@ tfb = tfp.bijectors
 
 
 Params = flax.core.FrozenDict[str, Any]
+EPS = 1e-8
 LOG_STD_MAX = 2
 LOG_STD_MIN = -10
 
 
-class HistoryAutoEncoder(nn.Module):
+class VariationalAutoEncoder(nn.Module):
     state_dim: int
     latent_dim: int
     squashed_output: bool = True
@@ -51,7 +52,7 @@ class HistoryAutoEncoder(nn.Module):
         self,
         history: jnp.ndarray,
         deterministic: bool = False,
-    ) -> [jnp.ndarray, jnp.ndarray, Tuple[np.ndarray, ...]]:
+    ) -> [jnp.ndarray, jnp.ndarray, Tuple[jnp.ndarray, ...]]:
 
         rng, key = self.make_rng("decoder")
         decoder_key = jax.random.PRNGKey(rng)
@@ -75,7 +76,7 @@ class HistoryAutoEncoder(nn.Module):
         history: [batch_size, len_subtraj, obs_dim + action_dim + additional_dim]
         """
         emb = self.encoder(history, deterministic)
-        emb = np.mean(emb, axis=1)
+        emb = np.mean(emb, axis=1)                      # Take mean w.r.t timestep axis
         mu = self.mu(emb, deterministic)
         log_std = self.log_std(emb, deterministic)
         log_std = np.clip(log_std, -4.0, 10.0)
@@ -97,6 +98,94 @@ class HistoryAutoEncoder(nn.Module):
         # latent = mu + std * jax.random.standard_normal(std.shape)
         latent = mu + std * jax.random.normal(key, shape=mu.shape)
         return latent
+
+
+class WassersteinAutoEncoder(nn.Module):
+    state_dim: int
+    latent_dim: int
+    squashed_output: bool = True
+    dropout: float = 0.1
+    rbf_var: float = 5.0
+    reg_weight: float = 100.0
+
+    encoder = None
+    decoder = None
+    mu = None
+    log_std = None
+    decoder_key = 0
+
+    def setup(self):
+        encoder_net_arch = [256, 256, self.latent_dim]
+        self.encoder = MLP(net_arch=encoder_net_arch, dropout=self.dropout)
+
+        decoder_net_arch = [256, 256, self.state_dim]
+        self.decoder = MLP(net_arch=decoder_net_arch, dropout=self.dropout, squashed_out=self.squashed_output)
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def forward(
+            self,
+            history: jnp.ndarray,
+            deterministic: bool = False,
+    ) -> [jnp.ndarray, jnp.ndarray, Tuple[jnp.ndarray, ...]]:
+        """
+        :param history: [batch_size, history_len, observation_dim + action_dim]
+        :param deterministic:
+        """
+        rng = self.make_rng("noise")
+
+        if history.ndim == 1:
+            history = history[np.newaxis, np.newaxis, ...]
+        elif history.ndim == 2:
+            history = history[np.newaxis, ...]
+
+        history = TrajectoryBuffer.timestep_marking(history)
+
+        latent = self.encode(history, deterministic)        # Use deterministic encoder. No sampling
+        latent = (latent + jax.random.normal(rng, latent.shape) * (0.01 ** 2))
+
+        recon = self.decode(history, latent=latent, deterministic=deterministic)
+
+        return recon, latent
+
+    def encode(self, history: np.ndarray, deterministic: bool):
+        """
+        NOTE: Input history should be preprocessed before here, inside forward function.
+        history: [batch_size, len_subtraj, obs_dim + action_dim + additional_dim]
+        """
+        latent = self.encoder(history, deterministic)
+        latent = jnp.mean(latent, axis=1)
+        return latent
+
+    def decode(self, history: np.ndarray, deterministic: bool, latent: np.ndarray = None) -> jnp.ndarray:
+        if latent is None:
+            history, *_ = TrajectoryBuffer.timestep_marking(history)
+            latent = self.encode(history, deterministic)
+
+        recon = self.decoder(latent, deterministic)
+        return recon
+
+    def rbf_mmd_loss(self, z: jnp.ndarray, key: jnp.ndarray) -> jnp.ndarray:
+        # Compute the mmd loss with rbf kernel
+        prior_shape = z.shape
+        batch_size = prior_shape[0]
+
+        reg_weight = self.reg_weight / batch_size
+        prior_z = jax.random.normal(key, prior_shape)       # batch_size, latent_dim
+
+        zz = jnp.mean(self.compute_kernel(prior_z, prior_z))
+        zhat_zhat = jnp.mean(self.compute_kernel(z, z))
+        z_zhat = jnp.mean(self.compute_kernel(z, prior_z))
+
+        return reg_weight * (zz + zhat_zhat + z_zhat)
+
+    def compute_kernel(self, x1: jnp.ndarray, x2: jnp.ndarray) -> jnp.ndarray:
+        z_dim = x1.shape[-1]
+        x1 = jnp.expand_dims(x1, axis=0)
+        x2 = jnp.expand_dims(x2, axis=1)
+        kernel = jnp.exp(- (x1 - x2) ** 2 / (2.0 * z_dim * self.rbf_var))
+        return kernel
 
 
 class SASPredictor(nn.Module):      # Input: s, a // Output: predicted next state (S x A --> S: SAS)
@@ -131,7 +220,7 @@ class MSEActor(nn.Module):
     def setup(self):
         net_arch = self.net_arch
         if net_arch is None:
-            net_arch = [256, 256, 256, self.action_dim]
+            net_arch = [512, 512, 512, self.action_dim]
         assert net_arch[-1] == self.action_dim
         self.mu = MLP(net_arch, dropout=self.dropout, squashed_out=True)
 

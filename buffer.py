@@ -117,9 +117,10 @@ class TrajectoryBuffer(BaseBuffer):
 
         for idx, batch in enumerate(batch_inds):
             timestep = timesteps[idx]
-            hist_obs = self.observation_traj[batch, timestep - history_len: timestep, ...]
-            hist_act = self.action_traj[batch, timestep - history_len: timestep, ...]
-            cur_hist_len = len(hist_obs)        # 앞쪽에서 timestep이 골라지면, history_len보다 짧아진다.
+            start_pts = np.max([timestep - history_len, 0])
+            hist_obs = self.observation_traj[batch, start_pts: timestep, ...]
+            hist_act = self.action_traj[batch, start_pts: timestep, ...]
+            cur_hist_len = len(hist_obs)        # 앞쪽에서 timestep이 골라지면, 인자로 받은 history_len보다 짧아진다.
 
             hist_padding_obs = np.zeros((history_len - cur_hist_len, self.observation_dim))
             hist_padding_act = np.zeros((history_len - cur_hist_len, self.action_dim))

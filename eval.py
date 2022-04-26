@@ -6,6 +6,7 @@ import jax.numpy as jnp
 
 from delimg import DeliMGMSE, DeliMGMLE
 from model import Model
+from functools import partial
 
 
 class DeliSampler(object):
@@ -28,12 +29,16 @@ class DeliSampler(object):
         self.normalizing_factor = normalizing_factor
         self.history_len = history_len
 
+        self.observation_dim = None
+        self.action_dim = None
+
     def __len__(self):
         return len(self.history_observation)
 
     def normalize_obs(self, observation: jnp.ndarray):
         return observation.copy() / self.normalizing_factor
 
+    @partial(jax.jit, static_argnums=(0, ))
     def get_history_latent(self):
         if len(self) == 0:
             self.key, normal_key = jax.random.split(self.key, 2)
@@ -43,6 +48,14 @@ class DeliSampler(object):
             self.key, dropout_key, decoder_key = jax.random.split(self.key, 3)
             history_obs = jnp.vstack(self.history_observation)[-self.history_len:, ...]
             history_act = jnp.vstack(self.history_action)[-self.history_len:, ...]
+
+            cur_hist_len = len(history_obs)
+            hist_padding_obs = jnp.zeros((self.history_len - cur_hist_len, self.observation_dim))
+            hist_padding_act = jnp.zeros((self.history_len - cur_hist_len, self.action_dim))
+
+            history_obs = jnp.vstack((hist_padding_obs, history_obs))
+            history_act = jnp.vstack((hist_padding_act, history_act))
+
             vae_input = jnp.hstack((history_obs, history_act))
             _, latent, *_ = self.vae.apply_fn(
                 {"params": self.vae.params},
@@ -54,6 +67,9 @@ class DeliSampler(object):
         return jnp.squeeze(latent)
 
     def append(self, observation: jnp.ndarray, action: jnp.ndarray) -> None:
+        self.observation_dim = observation.shape[-1]
+        self.action_dim = action.shape[-1]
+
         if observation.ndim == 1:
             observation = observation[jnp.newaxis, ...]
         self.history_observation.append(observation.copy())
@@ -79,7 +95,7 @@ def evaluate_deli(
     history_len = model.history_len
     normalizing_factor = model.replay_buffer.normalizing_factor
     latent_dim = model.latent_dim
-    vae = model.vae
+    vae = model.ae
 
     sampler = DeliSampler(seed, latent_dim, vae, normalizing_factor, history_len)
     episodic_rewards = []

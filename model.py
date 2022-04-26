@@ -84,7 +84,6 @@ class Model(object):
         new_params = optax.apply_updates(self.params, updates)
 
         new_model = self.replace(step=self.step + 1, params=new_params, opt_state=new_opt_state)
-
         if has_aux:
             return new_model, aux
         else:
