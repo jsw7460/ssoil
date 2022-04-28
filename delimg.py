@@ -16,25 +16,10 @@ from buffer import TrajectoryBuffer
 from core import _update_mse_jit, _update_mse_jit_flow, _update_mle_jit
 from model import Model
 from networks import VariationalAutoEncoder, WassersteinAutoEncoder, SASPredictor, MSEActor, MLEActor
+from misc import get_sa_dim, DeliFeaturesExtractor
 
 Params = flax.core.FrozenDict[str, Any]
 
-
-def get_sa_dim(env: gym.Env) -> Tuple:
-    return env.observation_space.shape[0], env.action_space.shape[0]
-
-
-class DeliFeaturesExtractor(nn.Module):
-    _observation_dim: int
-    _latent_dim: int
-
-    @property
-    def features_dim(self) -> int:
-        return self._observation_dim + self._latent_dim
-
-    @nn.compact
-    def __call__(self, observations: jnp.ndarray) -> jnp.ndarray:
-        return observations.reshape((observations.shape[0], -1))
 
 
 class Deli(object):
@@ -225,7 +210,7 @@ class DeliMGMSE(Deli):
         replay_data = self.replay_buffer.history_sample(
             batch_size=batch_size,
             history_len=self.history_len,
-            st_future_len=7
+            st_future_len=50
         )
         self.key, key = jax.random.split(self.key, 2)
 
@@ -354,7 +339,6 @@ class DeliMGMLE(Deli):
             st_future_len=7
         )
         self.key, key = jax.random.split(self.key, 2)
-
         new_key, new_sas_predictor, new_vae, new_actor, infos = _update_mle_jit(
             rng=key,
             actor=self.actor,

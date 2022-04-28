@@ -10,6 +10,8 @@ from buffer import TrajectoryBuffer
 from model import MLP
 
 from tensorflow_probability.substrates import jax as tfp
+from misc import FlattenExtractor
+
 tfd = tfp.distributions
 tfb = tfp.bijectors
 
@@ -26,6 +28,7 @@ class VariationalAutoEncoder(nn.Module):
     squashed_output: bool = True
     dropout: float = 0.1
 
+    flatten_extractor = None
     encoder = None
     decoder = None
     mu = None
@@ -33,6 +36,8 @@ class VariationalAutoEncoder(nn.Module):
     decoder_key = 0
 
     def setup(self):
+        self.flatten_extractor = FlattenExtractor()
+
         encoder_net_arch = [32, 32, self.latent_dim]
         self.encoder = MLP(net_arch=encoder_net_arch, dropout=self.dropout)
 
@@ -64,6 +69,7 @@ class VariationalAutoEncoder(nn.Module):
 
         history = TrajectoryBuffer.timestep_marking(history)
 
+        history = self.flatten_extractor(history)
         mu, log_std = self.encode(history, deterministic)
         latent = self.get_latent_vector(mu, log_std, decoder_key)
 
@@ -76,11 +82,10 @@ class VariationalAutoEncoder(nn.Module):
         history: [batch_size, len_subtraj, obs_dim + action_dim + additional_dim]
         """
         emb = self.encoder(history, deterministic)
-        emb = np.mean(emb, axis=1)                      # Take mean w.r.t timestep axis
+        # emb = np.mean(emb, axis=1)                      # NOTE: Take mean w.r.t timestep axis
         mu = self.mu(emb, deterministic)
         log_std = self.log_std(emb, deterministic)
         log_std = np.clip(log_std, -4.0, 10.0)
-
         return mu, log_std
 
     def decode(self, history: np.ndarray, deterministic: bool, latent: np.ndarray = None) -> jnp.ndarray:
@@ -220,16 +225,19 @@ class MSEActor(nn.Module):
     def setup(self):
         net_arch = self.net_arch
         if net_arch is None:
-            net_arch = [512, 512, 512, self.action_dim]
+            net_arch = [256, 256, 256, self.action_dim]
         assert net_arch[-1] == self.action_dim
         self.mu = MLP(net_arch, dropout=self.dropout, squashed_out=True)
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
-    def forward(self, x, deterministic: bool = False):
+    def forward(self, x: jnp.ndarray, deterministic: bool = False):
         x = self.features_extractor(x)
         return self.mu(x, deterministic=deterministic)
+
+    def deterministic_action(self, x: jnp.ndarray, deterministic: bool = False):
+        return self.forward(x, deterministic)
 
 
 class MLEActor(nn.Module):
@@ -288,3 +296,8 @@ class MLEActor(nn.Module):
         base_dist = tfd.MultivariateNormalDiag(loc=mean_actions, scale_diag=jnp.exp(log_std))
         sampled_action = tfd.TransformedDistribution(distribution=base_dist, bijector=tfb.Tanh())
         return sampled_action.sample(seed=action_sample_key)
+
+    # This is for deterministic action: no sampling, just return "mean"
+    def deterministic_action(self, x: jnp.ndarray, deterministic: bool = False):
+        mean_actions, *_ = self.get_action_dist_params(x, deterministic=deterministic)
+        return mean_actions

@@ -3,8 +3,11 @@ from typing import Union
 import gym
 import jax
 import jax.numpy as jnp
+import numpy as np
 
-from delimg import DeliMGMSE, DeliMGMLE
+from delimse import DeliMGMSE, MSEActor
+from delimle import DeliMGMLE, MLEActor
+from bc import DeliBC
 from model import Model
 from functools import partial
 
@@ -45,7 +48,7 @@ class DeliSampler(object):
             latent = jax.random.normal(normal_key, shape=(self.latent_dim, ))
 
         else:
-            self.key, dropout_key, decoder_key = jax.random.split(self.key, 3)
+            self.key, dropout_key, decoder_key, noise_key = jax.random.split(self.key, 4)
             history_obs = jnp.vstack(self.history_observation)[-self.history_len:, ...]
             history_act = jnp.vstack(self.history_action)[-self.history_len:, ...]
 
@@ -55,13 +58,12 @@ class DeliSampler(object):
 
             history_obs = jnp.vstack((hist_padding_obs, history_obs))
             history_act = jnp.vstack((hist_padding_act, history_act))
-
             vae_input = jnp.hstack((history_obs, history_act))
             _, latent, *_ = self.vae.apply_fn(
                 {"params": self.vae.params},
                 vae_input,
                 deterministic=True,
-                rngs={"dropout": dropout_key, "decoder": decoder_key}
+                rngs={"dropout": dropout_key, "decoder": decoder_key, "noise": noise_key}
             )
 
         return jnp.squeeze(latent)
@@ -85,6 +87,24 @@ class DeliSampler(object):
         return policy_input
 
 
+@partial(jax.jit, static_argnums=(3, ))
+def _predict(
+    key: jnp.ndarray,
+    actor: Model,
+    observations: jnp.ndarray,
+    deterministic: bool = True
+) -> jnp.ndarray:
+
+    rng, dropout_key, action_sample_key = jax.random.split(key, 3)
+    action = actor.apply_fn(
+        {"params": actor.params},
+        observations,
+        deterministic=deterministic,
+        rngs={"dropout": dropout_key, "action_sample": action_sample_key}
+    )
+    return action
+
+
 def evaluate_deli(
     seed: int,
     env: gym.Env,
@@ -92,12 +112,15 @@ def evaluate_deli(
     n_eval_episodes: int = 10,
     deterministic: bool = True,
 ):
+    env.seed(seed)
     history_len = model.history_len
     normalizing_factor = model.replay_buffer.normalizing_factor
     latent_dim = model.latent_dim
     vae = model.ae
-
     sampler = DeliSampler(seed, latent_dim, vae, normalizing_factor, history_len)
+
+    # print("Params", model.actor.params["latent_pi"]["Dense_0"])
+
     episodic_rewards = []
     episodic_lengths = []
 
@@ -110,8 +133,10 @@ def evaluate_deli(
         current_lengths = 0
         while not dones:
             current_lengths += 1
+            key = jax.random.PRNGKey(seed)
             policy_input = sampler.get_delig_policy_input(observation)
-            action = model._predict(policy_input, deterministic=deterministic)
+            action = _predict(key, model.actor, observations=policy_input, deterministic=deterministic)
+            # action = model._predict(policy_input, deterministic=deterministic)
             if action.ndim == 0:
                 action = action[jnp.newaxis, ...]
 
@@ -126,3 +151,39 @@ def evaluate_deli(
 
     return jnp.mean(jnp.array(episodic_rewards)), jnp.mean(jnp.array(episodic_lengths))
 
+
+def evaluate_bc(
+    seed: int,
+    env: gym.Env,
+    model: Union[DeliBC],
+    n_eval_episodes: int = 10,
+    deterministic: bool = True,
+):
+    episodic_rewards = []
+    episodic_lengths = []
+
+    for i in range(n_eval_episodes):
+        observation = env.reset()
+        dones = False
+        current_rewards = 0
+        current_lengths = 0
+        while not dones:
+            current_lengths += 1
+            observation = observation[np.newaxis, ...]
+
+            key = jax.random.PRNGKey(seed)
+            noise = jax.random.normal(key, shape=observation.shape)
+            policy_input = jnp.concatenate((observation, noise), axis=1)
+            action = _predict(key, model.actor, observations=policy_input, deterministic=deterministic)
+            # action = model._predict(observation, deterministic=deterministic)
+            if action.ndim == 0:
+                action = action[jnp.newaxis, ...]
+            next_observation, rewards, dones, infos = env.step(action)
+            current_rewards += rewards
+
+            observation = next_observation
+
+        episodic_rewards.append(current_rewards)
+        episodic_lengths.append(current_lengths)
+
+    return jnp.mean(jnp.array(episodic_rewards)), jnp.mean(jnp.array(episodic_lengths))

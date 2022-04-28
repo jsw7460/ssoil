@@ -13,7 +13,7 @@ Params = flax.core.FrozenDict[str, Any]
 
 
 def default_init():
-    return nn.initializers.he_normal()
+    return nn.initializers.lecun_normal()
 
 
 class MLP(nn.Module):
