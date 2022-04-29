@@ -1,6 +1,5 @@
 import gym
 from delimse import DeliMGMSE
-from delimle import DeliMGMLE
 from bc import DeliBC
 import argparse
 from eval import evaluate_deli, evaluate_bc
@@ -11,7 +10,7 @@ import d4rl
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--algo", type=str)
+    parser.add_argument("--algo", type=str, default="mse")
     parser.add_argument("--env_name", type=str, default="hopper-medium-v2")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--device", type=str, default="cuda")
@@ -23,13 +22,8 @@ if __name__ == "__main__":
     parser.add_argument("--latent_dim", type=int, default=25)
     parser.add_argument("--additional_dim", type=int, default=1)
 
-    parser.add_argument("--buffer_size", type=int, default=10)
-    parser.add_argument("--perturb", type=float, default=0.0)
     parser.add_argument("--context_length", type=int, default=20)
 
-    parser.add_argument("--var", type=int, default=0)
-    parser.add_argument("--grad_flow", action="store_true")
-    parser.add_argument("--st", action="store_true", help="If true, use short-term future to predict")
     parser.add_argument("--flow", action="store_true")
     parser.add_argument("--expert_goal", action="store_true")
 
@@ -44,9 +38,6 @@ if __name__ == "__main__":
     evaluator = None
     if args.algo == "mse":
         algo = DeliMGMSE
-        evaluator = evaluate_deli
-    elif args.algo == "mle":
-        algo = DeliMGMLE
         evaluator = evaluate_deli
     elif args.algo == "bc":
         algo = DeliBC
@@ -73,7 +64,7 @@ if __name__ == "__main__":
         env,
         seed=args.seed,
         grad_flow=args.flow,
-        tensorboard_log=tensorboard_log,
+        # tensorboard_log=tensorboard_log,
         data_path=expert_data_path,
         dropout=args.dropout,
         _init_setup_model=True,
@@ -82,7 +73,7 @@ if __name__ == "__main__":
 
     # model.load_data(expert_data_path)
     for i in range(200):
-        model.learn(total_timesteps=5000, batch_size=1024)
+        model.learn(total_timesteps=5000, batch_size=4096)
         returns, _ = evaluator(seed=args.seed, env=env, model=model, n_eval_episodes=10, deterministic=True)
         normalized_returns = env.get_normalized_score(returns) * 100
         model.diagnostics["evaluations/rewards"].append(returns)

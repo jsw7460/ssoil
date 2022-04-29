@@ -7,11 +7,22 @@ import jax.numpy as jnp
 import jax.random
 import optax
 
-from core import _update_mse_jit, _update_mse_jit_flow, _update_mse_jit_goal_loss
+from core import (
+    _update_mse_jit,
+    _update_mse_jit_flow,
+    _update_mse_jit_goal_loss,
+    _update_mse_jit_goal_loss_flow
+)
 from deli import Deli
 from misc import DeliFeaturesExtractor
 from model import Model
-from networks import VariationalAutoEncoder, SASPredictor, MSEActor
+from networks import (
+    VariationalAutoEncoder,
+    WassersteinAutoEncoder,
+    GeneralizedAutoEncoder,
+    SASPredictor,
+    MSEActor
+)
 
 Params = flax.core.FrozenDict[str, Any]
 
@@ -45,7 +56,7 @@ class DeliMGMSE(Deli):
         self.grad_flow = grad_flow
 
         if expert_goal:
-            self.update_ft = _update_mse_jit_goal_loss
+            self.update_ft = _update_mse_jit_goal_loss_flow if self.grad_flow else _update_mse_jit_goal_loss
         else:
             self.update_ft = _update_mse_jit_flow if self.grad_flow else _update_mse_jit
 
@@ -89,19 +100,29 @@ class DeliMGMSE(Deli):
         )
 
         # AE
+
         # ae_def = WassersteinAutoEncoder(            # Or Variational Autoencoder
         #     state_dim=self.observation_dim,
         #     latent_dim=self.latent_dim,
         #     squashed_output=True,
         # )
-        ae_def = VariationalAutoEncoder(
+
+        # ae_def = VariationalAutoEncoder(
+        #     state_dim=self.observation_dim,
+        #     latent_dim=self.latent_dim,
+        #     squashed_output=True
+        # )
+
+        ae_def = GeneralizedAutoEncoder(
             state_dim=self.observation_dim,
             latent_dim=self.latent_dim,
-            squashed_output=True
+            squashed_output=True,
+            n_nbd=5,
         )
         init_ae_input = jnp.repeat(init_history, repeats=self.history_len, axis=0)
         ae_key, dropout_key, decoder_key, noise_key = jax.random.split(ae_key, 4)
         init_ae_rngs = {"params": ae_key, "dropout": dropout_key, "decoder": decoder_key, "noise": noise_key}
+
         self.ae = Model.create(
             model_def=ae_def,
             inputs=[init_ae_rngs, init_ae_input],
@@ -145,8 +166,10 @@ class DeliMGMSE(Deli):
             history_len=self.history_len,
             st_future_len=7,
         )
+
+        # Define the goal state
         if self.expert_buffer is not None:
-            goal_data = self.expert_buffer.sample(key=key, batch_size=batch_size)
+            goal_data = self.expert_buffer.sample_only_final_state(key=key, batch_size=batch_size)
             goal_observations = goal_data.observations[:, jnp.newaxis, :]
             goal_actions = goal_data.actions[:, jnp.newaxis, :]
         else:
@@ -163,14 +186,15 @@ class DeliMGMSE(Deli):
             observations=replay_data.observations,
             actions=replay_data.actions,
             next_observations=replay_data.st_future.observations[:, 0, :][:, jnp.newaxis, :],
+            st_future_observations=replay_data.st_future.observations,
             goal_observations=goal_observations,
             goal_actions=goal_actions
         )
+
         self.sas_predictor = new_sas_predictor
         self.ae = new_ae
         self.actor = new_actor
         self.n_updates += 1
-
         return infos
 
     def get_save_params(self) -> Dict:

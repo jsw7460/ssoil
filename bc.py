@@ -16,6 +16,7 @@ from networks import MSEActor
 Params = flax.core.FrozenDict[str, Any]
 
 
+# Goal conditioned RL로 구현을 하는데, goal을 expert dataset에서 뽑는 것으로 ..
 class DeliBC(Deli):
     def __init__(
         self,
@@ -24,8 +25,9 @@ class DeliBC(Deli):
         seed: int = 0,
         dropout: float = 0.0,
         tensorboard_log: str = None,
-        augmentation: bool = True,
+        augmentation: bool = False,
         data_path: str = None,
+        expert_goal: bool = True,
         **actor_kwargs
     ):
         super(DeliBC, self).__init__(
@@ -33,7 +35,8 @@ class DeliBC(Deli):
             learning_rate=learning_rate,
             seed=seed,
             dropout=dropout,
-            tensorboard_log=tensorboard_log
+            tensorboard_log=tensorboard_log,
+            expert_goal=expert_goal
         )
         self.actor: Model = None
         self.actor_kwargs = actor_kwargs
@@ -41,6 +44,7 @@ class DeliBC(Deli):
         self.key = jax.random.PRNGKey(seed)
 
         self.augmentation = augmentation
+
         self.setup_model()
         self.load_data(data_path, use_jax=True)
 
@@ -99,3 +103,9 @@ class DeliBC(Deli):
         self.actor = new_actor
         self.n_updates += 1
         return infos
+
+    def get_save_params(self):
+        pass
+
+    def get_load_params(self):
+        pass

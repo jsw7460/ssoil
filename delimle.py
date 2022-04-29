@@ -6,7 +6,6 @@ import jax.numpy as jnp
 import jax.random
 import optax
 
-from core import _update_mle_jit, _update_mle_jit_flow
 from deli import Deli
 from misc import DeliFeaturesExtractor
 from model import Model

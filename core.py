@@ -9,12 +9,12 @@ import jax.random
 from buffer import StateActionBufferSample
 from core_comp import (
     update_vae,
+    update_wae,
+    update_gae,
     update_sas,
-    update_vae_by_mle_policy,
-    update_mle_actor,
     update_mse_actor,
-    update_vae_by_mse_policy,
-    update_mse_actor_by_goal_loss
+    update_ae_by_mse_policy,
+    update_mse_actor_by_goal_loss,
 )
 from model import Model
 
@@ -57,6 +57,7 @@ def _update_mse_jit(
         observations: jnp.ndarray,
         actions: jnp.ndarray,
         next_observations: jnp.ndarray,
+        st_future_observations: jnp.ndarray,
         goal_observations: jnp.ndarray,
         goal_actions: jnp.ndarray,
 ):
@@ -94,12 +95,14 @@ def _update_mse_jit(
     batch_size = observations.shape[0]
     target_goals = goal_observations[jnp.arange(batch_size), max_indices, ...]
 
-    new_ae, vae_info = update_vae(
+    new_ae, vae_info = update_gae(
         key=key,
         ae=ae,
         history_observations=history_observations,
         history_actions=history_actions,
+        observations=observations,
         target_goals=target_goals,
+        future_observations=st_future_observations
     )
 
     ae_input = jnp.concatenate((history_observations, history_actions), axis=2)
@@ -132,7 +135,7 @@ def _update_mse_jit(
 
 @jax.jit
 def _update_mse_jit_flow(
-        rng: int,
+        rng: jnp.ndarray,
         actor: Model,
         ae: Model,
         sas_predictor: Model,
@@ -175,7 +178,7 @@ def _update_mse_jit_flow(
     # Now we define the target future
     batch_size = observations.shape[0]
     target_goals = goal_observations[jnp.arange(batch_size), max_indices, ...]
-    new_ae, vae_info = update_vae(
+    new_ae, vae_info = update_wae(
         key=key,
         ae=ae,
         history_observations=history_observations,
@@ -205,7 +208,7 @@ def _update_mse_jit_flow(
 
     # Note Start: 4. VAE train by gradients of actor
     rng, key = jax.random.split(rng)
-    new_ae, vae_flow_info = update_vae_by_mse_policy(
+    new_ae, vae_flow_info = update_ae_by_mse_policy(
         key=key,
         actor=new_actor,
         ae=new_ae,
@@ -215,172 +218,6 @@ def _update_mse_jit_flow(
         actions=actions,
     )
 
-    return rng, new_sas_predictor, new_ae, new_actor, {**sas_predictor_info, **vae_info, **actor_info, **vae_flow_info}
-
-
-@jax.jit
-def _update_mle_jit(
-        rng: int,
-        actor: Model,
-        ae: Model,
-        sas_predictor: Model,
-        history_observations: jnp.ndarray,
-        history_actions: jnp.ndarray,
-        observations: jnp.ndarray,
-        actions: jnp.ndarray,
-        next_observations: jnp.ndarray,
-        goal_observations: jnp.ndarray,
-        goal_actions: jnp.ndarray,
-):
-    # 1. SAS train 2. VAE train 3. Actor train
-
-    # Note Start: 1. SAS train
-    rng, key = jax.random.split(rng)
-    new_sas_predictor, sas_predictor_info = update_sas(
-        key=key,
-        sas_predictor=sas_predictor,
-        observations=observations,
-        actions=actions,
-        next_state=next_observations
-    )
-    # Get a states with highets gradient
-
-    # Note Start: 2. VAE train
-    rng, key = jax.random.split(rng)
-
-    # Compute the maximum gradient state
-    # To do this, we have to define the function to calculate the partial derivation
-    def mean_state_change(params: Params, observations: jnp.ndarray, actions: jnp.ndarray):
-        sas_predictor_input = jnp.concatenate((observations, actions), axis=2)
-        next_state_pred \
-            = sas_predictor.apply_fn({"params": params}, sas_predictor_input, rngs={"dropout": key})
-        return jnp.mean(next_state_pred)
-
-    diff_ft = jax.grad(mean_state_change, 2)
-    state_grads = diff_ft(sas_predictor.params, goal_observations, goal_actions)
-    state_grads = jnp.mean(state_grads, axis=2)
-    max_indices = jnp.argmax(state_grads, axis=1)
-
-    # Now we define the target future
-    batch_size = observations.shape[0]
-    target_goals = goal_observations[jnp.arange(batch_size), max_indices, ...]
-
-    new_vae, vae_info = update_vae(
-        key=key,
-        ae=ae,
-        history_observations=history_observations,
-        history_actions=history_actions,
-        target_goals=target_goals,
-    )
-
-    vae_input = jnp.concatenate((history_observations, history_actions), axis=2)
-    dropout_key, decoder_key = jax.random.split(key, 2)
-    _, history_latent, *_ = ae.apply_fn(
-        {"params": ae.params},
-        vae_input,
-        deterministic=True,
-        rngs={"dropout": dropout_key, "decoder": decoder_key}
-    )
-
-    # Note Start: 3. Actor train
-    rng, key = jax.random.split(rng)
-
-    new_actor, actor_info = update_mle_actor(
-        key=key,
-        actor=actor,
-        observations=observations,
-        actions=actions,
-        history_latent=history_latent
-    )
-    return rng, new_sas_predictor, new_vae, new_actor, {**sas_predictor_info, **vae_info, **actor_info}
-
-
-@jax.jit
-def _update_mle_jit_flow(
-    rng: int,
-    actor: Model,
-    ae: Model,
-    sas_predictor: Model,
-    history_observations: jnp.ndarray,
-    history_actions: jnp.ndarray,
-    observations: jnp.ndarray,
-    actions: jnp.ndarray,
-    next_observations: jnp.ndarray,
-    goal_observations: jnp.ndarray,
-    goal_actions: jnp.ndarray,
-):
-    # 1. SAS train 2. VAE train 3. Actor train
-
-    # Note Start: 1. SAS train
-    rng, key = jax.random.split(rng)
-    new_sas_predictor, sas_predictor_info = update_sas(
-        key=key,
-        sas_predictor=sas_predictor,
-        observations=observations,
-        actions=actions,
-        next_state=next_observations,
-    )
-    # Get a states with highets gradient
-
-    # Note Start: 2. VAE train
-    rng, key = jax.random.split(rng)
-
-    # Compute the maximum gradient state
-    # To do this, we have to define the function to calculate the partial derivation
-    def mean_state_change(params: Params, _observations: jnp.ndarray, _actions: jnp.ndarray):
-        sas_predictor_input = jnp.concatenate((_observations, _actions), axis=2)
-        next_state_pred \
-            = sas_predictor.apply_fn({"params": params}, sas_predictor_input, rngs={"dropout": key})
-        return jnp.mean(next_state_pred)
-
-    diff_ft = jax.grad(mean_state_change, 2)
-    state_grads = diff_ft(sas_predictor.params, goal_observations, goal_actions)
-    state_grads = jnp.mean(state_grads, axis=2)
-    max_indices = jnp.argmax(state_grads, axis=1)
-
-    # Now we define the target future
-    batch_size = observations.shape[0]
-    target_goals = goal_observations[jnp.arange(batch_size), max_indices, ...]
-
-    new_ae, vae_info = update_vae(
-        key=key,
-        ae=ae,
-        history_observations=history_observations,
-        history_actions=history_actions,
-        target_goals=target_goals
-    )
-
-    vae_input = jnp.concatenate((history_observations, history_actions), axis=2)
-    dropout_key, decoder_key = jax.random.split(key, 2)
-    _, history_latent, *_ = ae.apply_fn(
-        {"params": ae.params},
-        vae_input,
-        deterministic=True,
-        rngs={"dropout": dropout_key, "decoder": decoder_key}
-    )
-
-    # Note Start: 3. Actor train
-    rng, key = jax.random.split(rng)
-
-    new_actor, actor_info = update_mle_actor(
-        key=key,
-        actor=actor,
-        observations=observations,
-        actions=actions,
-        history_latent=history_latent
-    )
-
-    # Note Start: 4. VAE train by gradients of actor
-    rng, key = jax.random.split(rng)
-    new_ae, vae_flow_info = update_vae_by_mle_policy(
-        key=key,
-        actor=new_actor,
-        ae=new_ae,
-        observations=observations,
-        actions=actions,
-        history_observations=history_observations,
-        history_actions=history_actions
-    )
     return rng, new_sas_predictor, new_ae, new_actor, {**sas_predictor_info, **vae_info, **actor_info, **vae_flow_info}
 
 
@@ -412,7 +249,6 @@ def _update_mse_jit_goal_loss(
         goal_actions=goal_actions
     )
 
-    # target_goals = info["target_goals"]
     target_goals = goal_observations
     new_actor, goal_info = update_mse_actor_by_goal_loss(
         key=rng,
@@ -425,3 +261,46 @@ def _update_mse_jit_goal_loss(
         target_goals=target_goals,
     )
     return rng, new_sas_predictor, new_ae, new_actor, {**info, **goal_info}
+
+
+@jax.jit
+def _update_mse_jit_goal_loss_flow(
+        rng: jnp.ndarray,
+        actor: Model,
+        ae: Model,
+        sas_predictor: Model,
+        history_observations: jnp.ndarray,
+        history_actions: jnp.ndarray,
+        observations: jnp.ndarray,
+        actions: jnp.ndarray,
+        next_observations: jnp.ndarray,
+        goal_observations: jnp.ndarray,
+        goal_actions: jnp.ndarray,
+):
+    rng, new_sas_predictor, new_ae, new_actor, info = _update_mse_jit_flow(
+        rng=rng,
+        actor=actor,
+        ae=ae,
+        sas_predictor=sas_predictor,
+        history_observations=history_observations,
+        history_actions=history_actions,
+        observations=observations,
+        actions=actions,
+        next_observations=next_observations,
+        goal_observations=goal_observations,
+        goal_actions=goal_actions
+    )
+
+    target_goals = goal_observations
+    new_actor, goal_info = update_mse_actor_by_goal_loss(
+        key=rng,
+        sas_predictor=new_sas_predictor,
+        ae=new_ae,
+        actor=new_actor,
+        history_observations=history_observations,
+        history_actions=history_actions,
+        observations=observations,
+        target_goals=target_goals,
+    )
+    return rng, new_sas_predictor, new_ae, new_actor, {**info, **goal_info}
+

@@ -54,6 +54,7 @@ class TrajectoryBuffer(BaseBuffer):
         observation_dim: int,
         action_dim: int,
         normalize: bool = True,
+        limit: int = -1,
         use_jax: bool = False,
     ):
         import pickle
@@ -76,6 +77,7 @@ class TrajectoryBuffer(BaseBuffer):
         self.max_traj_len = max_traj_len
         self.normalize = normalize
         self.normalizing_factor = None
+        self.limit = limit
 
         self.observation_traj = None
         self.action_traj = None
@@ -111,10 +113,34 @@ class TrajectoryBuffer(BaseBuffer):
         else:
             self.normalizing_factor = 1.0
 
+        if self.limit > 0:
+            assert self.use_jax, "Landmark설정 할 때만 이걸 사용하라"
+            self.observation_traj = self.observation_traj[:self.limit, ...]
+            self.action_traj = self.action_traj[:self.limit, ...]
+
         if self.use_jax:
             self.observation_traj = jnp.array(self.observation_traj)
             self.action_traj = jnp.array(self.action_traj)
         self.observation_traj /= self.normalizing_factor
+
+    @partial(jax.jit, static_argnums=(0, 2))
+    def sample_only_final_state(self, key: jnp.ndarray, batch_size: int):
+        # Return just state-action samples
+        # With Gaussian noise
+        batch_key, timestep_key, normal_key = jax.random.split(key, 3)
+        batch_inds = jax.random.randint(batch_key, shape=(batch_size,), minval=0, maxval=self.buffer_size)
+        timesteps = jax.random.randint(
+            timestep_key,
+            shape=(self.buffer_size,),
+            minval=(self.traj_lengths - 1).squeeze(),
+            maxval=(self.traj_lengths - 1).squeeze()
+        )
+        timesteps = timesteps[batch_inds]
+
+        current_observations = self.observation_traj[batch_inds, timesteps, ...]
+        current_actions = self.action_traj[batch_inds, timesteps, ...]
+
+        return StateActionBufferSample(current_observations, current_actions)
 
     @partial(jax.jit, static_argnums=(0, 2))
     def sample(self, key: jnp.ndarray, batch_size: int):
@@ -132,9 +158,9 @@ class TrajectoryBuffer(BaseBuffer):
 
         current_observations = self.observation_traj[batch_inds, timesteps, ...]
         current_actions = self.action_traj[batch_inds, timesteps, ...]
-        noise = jax.random.normal(normal_key, shape=current_observations.shape) * 3e-4
 
-        current_observations = current_observations + noise
+        # noise = jax.random.normal(normal_key, shape=current_observations.shape) * 3e-4
+        # current_observations = current_observations + noise
 
         return StateActionBufferSample(current_observations, current_actions)
 
@@ -173,7 +199,7 @@ class TrajectoryBuffer(BaseBuffer):
 
         return batch_inds, timesteps
 
-    def history_sample(self, key, batch_size: int, history_len: int, st_future_len: int = None):
+    def history_sample(self, key, batch_size: int, history_len: int, st_future_len: int = None, k_nn: int = 0):
         batch_inds, timesteps = self._history_sample(key, batch_size)
 
         current_observations = self.observation_traj[batch_inds, timesteps, ...]
@@ -193,8 +219,6 @@ class TrajectoryBuffer(BaseBuffer):
             hist_obs = np.vstack((hist_padding_obs, hist_obs))
             hist_act = np.vstack((hist_padding_act, hist_act))
 
-            # history_observations[idx] = hist_obs
-            # history_actions[idx] = hist_act
             history_observations.append(hist_obs)
             history_actions.append(hist_act)
 

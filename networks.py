@@ -113,6 +113,7 @@ class WassersteinAutoEncoder(nn.Module):
     rbf_var: float = 5.0
     reg_weight: float = 100.0
 
+    flatten_extractor = None
     encoder = None
     decoder = None
     mu = None
@@ -120,10 +121,12 @@ class WassersteinAutoEncoder(nn.Module):
     decoder_key = 0
 
     def setup(self):
-        encoder_net_arch = [256, 256, self.latent_dim]
+        self.flatten_extractor = FlattenExtractor()
+
+        encoder_net_arch = [64, 64, self.latent_dim]
         self.encoder = MLP(net_arch=encoder_net_arch, dropout=self.dropout)
 
-        decoder_net_arch = [256, 256, self.state_dim]
+        decoder_net_arch = [64, 64, self.state_dim]
         self.decoder = MLP(net_arch=decoder_net_arch, dropout=self.dropout, squashed_out=self.squashed_output)
 
     def __call__(self, *args, **kwargs):
@@ -148,8 +151,7 @@ class WassersteinAutoEncoder(nn.Module):
         history = TrajectoryBuffer.timestep_marking(history)
 
         latent = self.encode(history, deterministic)        # Use deterministic encoder. No sampling
-        latent = (latent + jax.random.normal(rng, latent.shape) * (0.01 ** 2))
-
+        latent = (latent + jax.random.normal(rng, latent.shape) * 0.05)
         recon = self.decode(history, latent=latent, deterministic=deterministic)
 
         return recon, latent
@@ -159,15 +161,14 @@ class WassersteinAutoEncoder(nn.Module):
         NOTE: Input history should be preprocessed before here, inside forward function.
         history: [batch_size, len_subtraj, obs_dim + action_dim + additional_dim]
         """
+        history = self.flatten_extractor(history)
         latent = self.encoder(history, deterministic)
-        latent = jnp.mean(latent, axis=1)
         return latent
 
     def decode(self, history: np.ndarray, deterministic: bool, latent: np.ndarray = None) -> jnp.ndarray:
         if latent is None:
             history, *_ = TrajectoryBuffer.timestep_marking(history)
             latent = self.encode(history, deterministic)
-
         recon = self.decoder(latent, deterministic)
         return recon
 
@@ -183,7 +184,7 @@ class WassersteinAutoEncoder(nn.Module):
         zhat_zhat = jnp.mean(self.compute_kernel(z, z))
         z_zhat = jnp.mean(self.compute_kernel(z, prior_z))
 
-        return reg_weight * (zz + zhat_zhat + z_zhat)
+        return reg_weight * (zz + zhat_zhat - 2 * z_zhat)
 
     def compute_kernel(self, x1: jnp.ndarray, x2: jnp.ndarray) -> jnp.ndarray:
         z_dim = x1.shape[-1]
@@ -191,6 +192,66 @@ class WassersteinAutoEncoder(nn.Module):
         x2 = jnp.expand_dims(x2, axis=1)
         kernel = jnp.exp(- (x1 - x2) ** 2 / (2.0 * z_dim * self.rbf_var))
         return kernel
+
+
+class GeneralizedAutoEncoder(nn.Module):
+    state_dim: int
+    latent_dim: int
+    squashed_output: bool = True
+    dropout: float = 0.1
+    n_nbd: int = 5      # How many states we reconstruct?
+
+    flatten_extractor = None
+    encoder = None
+    decoder = None
+
+    def setup(self):
+        self.flatten_extractor = FlattenExtractor()
+
+        encoder_net_arch = [64, 64, self.latent_dim]
+        self.encoder = MLP(net_arch=encoder_net_arch, dropout=self.dropout)
+
+        # Reconstruct nearest "2 * (n_nbd + 1)" states.
+        # This is due to the "n_nbd history + current + n_nbd future" recon.
+        decoder_net_arch = [64, 64, self.state_dim * (2 * self.n_nbd + 1)]
+        self.decoder = MLP(net_arch=decoder_net_arch, dropout=self.dropout, squashed_out=self.squashed_output)
+
+    def __call__(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+
+    def forward(
+        self,
+        history: jnp.ndarray,
+        deterministic: bool = False
+    ) -> [jnp.ndarray, jnp.ndarray, Tuple[jnp.ndarray, ...]]:
+
+        if history.ndim == 1:
+            history = history[np.newaxis, np.newaxis, ...]
+        elif history.ndim == 2:
+            history = history[np.newaxis, ...]
+
+        history = TrajectoryBuffer.timestep_marking(history)
+
+        latent = self.encode(history, deterministic)  # Use deterministic encoder. No sampling
+        recon = self.decode(history, latent=latent, deterministic=deterministic)
+
+        return recon, latent
+
+    def encode(self, history: jnp.ndarray, deterministic: bool = False):
+        history = self.flatten_extractor(history)
+        latent = self.encoder(history, deterministic=deterministic)
+        return latent
+
+    def decode(self, history: jnp.ndarray, deterministic: bool = False, latent: jnp.ndarray = None) -> jnp.ndarray:
+        batch_size = history.shape[0]
+
+        if latent is None:
+            history, *_ = TrajectoryBuffer.timestep_marking(history)
+            latent = self.encode(history, deterministic)
+
+        recon = self.decoder(latent, deterministic)
+        recon = recon.reshape(batch_size, 2 * self.n_nbd + 1, self.state_dim)
+        return recon
 
 
 class SASPredictor(nn.Module):      # Input: s, a // Output: predicted next state (S x A --> S: SAS)
@@ -254,12 +315,14 @@ class MLEActor(nn.Module):
     def setup(self):
         emb_arch = self.emb_arch
         if emb_arch is None:
-            emb_arch = [256, 256, 256]
+            # emb_arch = [256, 256, 256]
+            emb_arch = [1]
         self.latent_pi = MLP(emb_arch, dropout=self.dropout, squashed_out=False)
 
         dec_arch = self.dec_arch
         if dec_arch is None:
-            dec_arch = [256, 256, self.action_dim]
+            # dec_arch = [256, 256, self.action_dim]
+            dec_arch = [1]
         assert dec_arch[-1] == self.action_dim
         self.mu = MLP(dec_arch, dropout=self.dropout, squashed_out=False)
         self.log_std = MLP(dec_arch, dropout=self.dropout, squashed_out=False)

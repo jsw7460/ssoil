@@ -10,6 +10,8 @@ from model import Model
 from networks import MLEActor, WassersteinAutoEncoder
 
 Params = flax.core.FrozenDict[str, Any]
+REGULARIZER = 10.0
+GAE_LE_COEFS = 1.0
 
 
 def update_sas(
@@ -43,6 +45,7 @@ def update_vae(
     history_observations: jnp.ndarray,
     history_actions: jnp.ndarray,
     target_goals: jnp.ndarray,
+    **kwargs
 ) -> Tuple[Model, Dict]:
     ae_input = jnp.concatenate((history_observations, history_actions), axis=2)
     dropout_key, decoder_key, noise_key = jax.random.split(key, 3)
@@ -80,102 +83,13 @@ def update_vae(
     return new_ae, info
 
 
-def update_vae_by_mse_policy(
-    key: jnp.ndarray,
-    actor: Model,
-    ae: Model,
-    history_observations: jnp.ndarray,
-    history_actions: jnp.ndarray,
-    observations: jnp.ndarray,
-    actions: jnp.ndarray,
-
-) -> Tuple[Model, Dict]:
-    ae_input = jnp.concatenate((history_observations, history_actions), axis=2)
-    dropout_key, decoder_key, noise_key = jax.random.split(key, 3)
-
-    def vae_loss_fn(params: Params) -> Tuple[jnp.ndarray, Dict]:
-        """
-        :param params: Params of the VAE.
-        """
-        _, latent, *_ = ae.apply_fn(
-            {"params": params},
-            ae_input,
-            deterministic=False,
-            rngs={"dropout": dropout_key, "decoder": decoder_key, "noise": noise_key}
-        )
-        actor_input = jnp.concatenate((observations, latent), axis=1)
-
-        action_pred = actor.apply_fn(
-            {"params": actor.params},       # This function does not update actor! It updates ae.
-            actor_input,
-            deterministic=False,
-            rngs={"dropout": dropout_key}
-        )
-
-        vae_loss = jnp.mean((action_pred - actions) ** 2)
-        return vae_loss, {"vae_loss_by_policy": vae_loss}
-
-    new_vae, info = ae.apply_gradient(vae_loss_fn)
-    return new_vae, info
-
-
-def update_vae_by_mle_policy(
-    key: jnp.ndarray,
-    actor: Model,
-    ae: Model,
-    observations: jnp.ndarray,
-    actions: jnp.ndarray,
-    history_observations: jnp.ndarray,
-    history_actions: jnp.ndarray,
-
-) -> Tuple[Model, Dict]:
-    ae_input = jnp.concatenate((history_observations, history_actions), axis=2)
-    dropout_key, decoder_key = jax.random.split(key)
-
-    actions = actions.clip(-1.0 + 1e-5, 1.0 - 1e-5)
-    gaussian_actions = jnp.arctanh(actions)
-
-    def vae_loss_fn(params: Params) -> Tuple[jnp.ndarray, Dict]:
-        """
-        :param params: Params of the VAE.
-        """
-        _, latent, *_ = ae.apply_fn(
-            {"params": params},
-            ae_input,
-            deterministic=False,
-            rngs={"dropout": dropout_key, "decoder": decoder_key}
-        )
-
-        actor_input = jnp.concatenate((observations, latent), axis=1)
-        mu, log_std = actor.apply_fn(
-            {"params": actor.params},
-            actor_input,
-            deterministic=False,
-            rngs={"dropout": dropout_key, "action_sample": decoder_key},
-            method=MLEActor.get_action_dist_params
-        )
-        var = jnp.exp(log_std) ** 2
-
-        # Compute log prob before applying the tanh transformation
-        log_prob = -((gaussian_actions - mu) ** 2) / (2 * var) - log_std - jnp.log(jnp.sqrt(2 * jnp.pi))
-        log_prob = jnp.sum(log_prob, axis=1)
-
-        # Due to tanh, we multiply the additional part
-        log_prob -= jnp.sum(jnp.log(1 - actions ** 2) + 1e-8, axis=1)
-
-        actor_loss = -jnp.mean(log_prob)
-        return actor_loss, {"actor_loss": actor_loss, "actor_mu": mu, "actor_std": jnp.exp(log_std)}
-
-    new_vae, info = ae.apply_gradient(vae_loss_fn)
-    return new_vae, info
-
-
 def update_wae(
     key: jnp.ndarray,
     ae: Model,
     history_observations: jnp.ndarray,
     history_actions: jnp.ndarray,
     target_goals: jnp.ndarray,
+    **kwargs
 ) -> Tuple[Model, Dict]:
 
     wae_input = jnp.concatenate((history_observations, history_actions), axis=2)
@@ -212,6 +126,99 @@ def update_wae(
     return new_wae, info
 
 
+def update_gae(
+    key: jnp.ndarray,
+    ae: Model,
+    history_observations: jnp.ndarray,
+    history_actions: jnp.ndarray,
+    observations: jnp.ndarray,
+    future_observations: jnp.ndarray,
+    n_nbd: int = 5,
+    **kwargs,
+):
+    batch_size = observations.shape[0]
+    future_len = future_observations.shape[1]
+
+    assert future_len > n_nbd
+
+    gae_input = jnp.concatenate((history_observations, history_actions), axis=2)
+    rng, dropout_key = jax.random.split(key)
+
+    # Coefficients: [batch_size, 2 * n_nbd + 1]
+    _observations = observations[:, jnp.newaxis, :]                                     # [batch_size, 1, state_dim]
+    dist_to_history = jnp.sum((_observations - history_observations) ** 2, axis=2)      # [batch_size, history_len]
+    dist_to_future = jnp.sum((_observations - future_observations) ** 2, axis=2)        # [batch_size, future_len]
+
+    dist_to_history = dist_to_history[:, -n_nbd:]
+    dist_to_future = dist_to_future[:, :n_nbd]
+
+    history_coefs = jnp.exp(-dist_to_history / GAE_LE_COEFS)
+    current_coefs = jnp.ones((batch_size, 1))
+    future_coefs = jnp.exp(-dist_to_future / GAE_LE_COEFS)
+
+    coefs = jnp.concatenate((history_coefs, current_coefs, future_coefs), axis=1)      # [batch_size, 2 * n_nbd + 1]
+
+    history_nbd = history_observations[:, -n_nbd:, :]                                  # [batch_size, n_nbd, state_dim]
+    future_nbd = future_observations[:, :n_nbd, :]
+
+    # [batch_size, 2 * n_nbd + 1, state_dim]
+    nbds = jnp.concatenate((history_nbd, observations[:, jnp.newaxis, :], future_nbd), axis=1)
+
+    def gae_loss_fn(params: Params) -> Tuple[jnp.ndarray, Dict]:
+        target_pred, latent = ae.apply_fn(
+            {"params": params},
+            gae_input,
+            deterministic=False,
+            rngs={"dropout": dropout_key}
+        )
+        gae_loss = jnp.sum((target_pred - nbds) ** 2, axis=2)                          # [batch_size, 2 * n_nbd + 1]
+        gae_loss = jnp.mean(coefs * gae_loss)
+
+        infos = {"gae_loss": gae_loss, "latent_tensor": latent}
+        return gae_loss, infos
+
+    new_gae, info = ae.apply_gradient(gae_loss_fn)
+    return new_gae, info
+
+
+def update_ae_by_mse_policy(
+    key: jnp.ndarray,
+    actor: Model,
+    ae: Model,
+    history_observations: jnp.ndarray,
+    history_actions: jnp.ndarray,
+    observations: jnp.ndarray,
+    actions: jnp.ndarray,
+) -> Tuple[Model, Dict]:
+    ae_input = jnp.concatenate((history_observations, history_actions), axis=2)
+    dropout_key, decoder_key, noise_key = jax.random.split(key, 3)
+
+    def ae_loss_fn(params: Params) -> Tuple[jnp.ndarray, Dict]:
+        """
+        :param params: Params of the VAE.
+        """
+        _, latent, *_ = ae.apply_fn(
+            {"params": params},
+            ae_input,
+            deterministic=False,
+            rngs={"dropout": dropout_key, "decoder": decoder_key, "noise": noise_key}
+        )
+        actor_input = jnp.concatenate((observations, latent), axis=1)
+
+        action_pred = actor.apply_fn(
+            {"params": actor.params},       # This function does not update actor! It updates ae.
+            actor_input,
+            deterministic=False,
+            rngs={"dropout": dropout_key}
+        )
+
+        ae_loss = jnp.mean((action_pred - actions) ** 2) * REGULARIZER
+        return ae_loss, {"vae_loss_by_policy": ae_loss}
+
+    new_vae, info = ae.apply_gradient(ae_loss_fn)
+    return new_vae, info
+
+
 def update_mse_actor(
     key: jnp.ndarray,
     actor: Model,
@@ -231,40 +238,6 @@ def update_mse_actor(
         actor_loss = jnp.mean((actor_action - actions) ** 2)
 
         return actor_loss, {"actor_loss": actor_loss}
-
-    new_actor, info = actor.apply_gradient(actor_loss_fn)
-    return new_actor, info
-
-
-def update_mle_actor(
-    key: jnp.ndarray,
-    actor: Model,
-    observations: jnp.ndarray,
-    actions: jnp.ndarray,
-    history_latent: jnp.ndarray,
-) -> Tuple[Model, Dict]:
-    actor_input = jnp.concatenate((observations, history_latent), axis=1)
-    actions = actions.clip(-1.0 + 1e-5, 1.0 - 1e-5)
-    gaussian_actions = jnp.arctanh(actions)
-
-    def actor_loss_fn(params: Params) -> Tuple[jnp.ndarray, Dict]:
-        mu, log_std = actor.apply_fn(
-            {"params": params},
-            actor_input,
-            deterministic=False,
-            rngs={"dropout": key, "action_sample": key},
-            method=MLEActor.get_action_dist_params
-        )
-        var = jnp.exp(log_std) ** 2
-        # Compute log prob before applying the tanh transformation
-        log_prob = -((gaussian_actions - mu) ** 2) / (2 * var) - log_std - jnp.log(jnp.sqrt(2 * jnp.pi))
-        log_prob = jnp.sum(log_prob, axis=1)
-
-        # Due to tanh, we multiply the additional part
-        log_prob -= jnp.sum(jnp.log(1 - actions ** 2) + 1e-8, axis=1)
-
-        actor_loss = -jnp.mean(log_prob)
-        return actor_loss, {"actor_loss": actor_loss, "actor_mu": jnp.mean(mu), "actor_log_std": jnp.mean(log_std)}
 
     new_actor, info = actor.apply_gradient(actor_loss_fn)
     return new_actor, info

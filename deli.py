@@ -37,11 +37,13 @@ class Deli(object):
         self.dropout = dropout
         self.replay_buffer: TrajectoryBuffer = None
         self.expert_buffer: TrajectoryBuffer = None
+        self.randmark_buffer: TrajectoryBuffer = None
         self.normalize = 0.0
         self.tensorboard_log = tensorboard_log
         self.expert_goal = expert_goal
 
-        self._writer = SummaryWriter(log_dir=self.tensorboard_log)
+        if tensorboard_log is not None:
+            self._writer = SummaryWriter(log_dir=self.tensorboard_log)
 
         self.offline_rounds = 0
         self.n_updates = 0
@@ -57,8 +59,8 @@ class Deli(object):
             use_jax=use_jax
         )
         env_name = data_path.split("/")[-1].split("-")[0]
+
         expert_data_path = "/workspace/expertdata/dttrajectory/" + env_name + "-expert-v2"
-        # expert_data_path = data_path.replace(env_name, "expert")
         self.normalize = self.replay_buffer.normalizing_factor
         if self.expert_goal:
             self.expert_buffer = TrajectoryBuffer(
@@ -66,20 +68,32 @@ class Deli(object):
                 observation_dim=self.observation_dim,
                 action_dim=self.action_dim,
                 normalize=True,
+                limit=1000,
                 use_jax=True
             )
+
+        self.randmark_buffer = self.expert_buffer if self.expert_buffer is not None else TrajectoryBuffer(
+            data_path=data_path,
+            observation_dim=self.observation_dim,
+            action_dim=self.action_dim,
+            normalize=True,
+            use_jax=False                   # We need slicing
+        )
 
     def _dump_logs(self):
         print("=" * 80)
         print("Env:\t", self.env_name)
         print("n_updates:\t", self.n_updates)
+
         for k, v in self.diagnostics.items():
             print(f"{k}: \t{jnp.mean(jnp.array(v))}")
-            self._writer.add_scalar(k, np.mean(np.array(v)), self.n_updates,)
+            if self._writer is not None:
+                self._writer.add_scalar(k, np.mean(np.array(v)), self.n_updates,)
 
-        print(f"Save to {self.tensorboard_log}")
-        self._writer.flush()
-        self._writer.close()
+        if self._writer is not None:
+            print(f"Save to {self.tensorboard_log}")
+            self._writer.flush()
+            self._writer.close()
 
         # Init
         self.diagnostics = defaultdict(list)
