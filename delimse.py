@@ -31,7 +31,7 @@ class DeliMGMSE(Deli):
     def __init__(
         self,
         env: gym.Env,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 3e-4,
         seed: int = 0,
         dropout: float = 0.1,
         history_len: int = 20,
@@ -122,7 +122,6 @@ class DeliMGMSE(Deli):
         init_ae_input = jnp.repeat(init_history, repeats=self.history_len, axis=0)
         ae_key, dropout_key, decoder_key, noise_key = jax.random.split(ae_key, 4)
         init_ae_rngs = {"params": ae_key, "dropout": dropout_key, "decoder": decoder_key, "noise": noise_key}
-
         self.ae = Model.create(
             model_def=ae_def,
             inputs=[init_ae_rngs, init_ae_input],
@@ -190,7 +189,6 @@ class DeliMGMSE(Deli):
             goal_observations=goal_observations,
             goal_actions=goal_actions
         )
-
         self.sas_predictor = new_sas_predictor
         self.ae = new_ae
         self.actor = new_actor

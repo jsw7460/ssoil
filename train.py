@@ -1,11 +1,11 @@
-import gym
-from delimse import DeliMGMSE
-from bc import DeliBC
 import argparse
-from eval import evaluate_deli, evaluate_bc
-import tensorboard
+
+import gym
 import d4rl
 
+from bc import DeliBC
+from delimse import DeliMGMSE
+from eval import evaluate_deli, evaluate_bc
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -73,12 +73,12 @@ if __name__ == "__main__":
 
     # model.load_data(expert_data_path)
     for i in range(200):
-        model.learn(total_timesteps=5000, batch_size=4096)
+        model.offline_learn(total_timesteps=5000, batch_size=4096)
         returns, _ = evaluator(seed=args.seed, env=env, model=model, n_eval_episodes=10, deterministic=True)
         normalized_returns = env.get_normalized_score(returns) * 100
         model.diagnostics["evaluations/rewards"].append(returns)
         model.diagnostics["evaluations/normalized_returns"].append(normalized_returns)
         model._dump_logs()
-        if i == 10:
+        if i % 10 == 0:
             model.save(filename_head + "model/" + filename_tail + f"ep-{i}")
             print("Model save")

@@ -1,6 +1,6 @@
-from abc import ABC
-from typing import NamedTuple
+from abc import ABC, abstractmethod
 from functools import partial
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -31,6 +31,14 @@ class StateActionBufferSample(NamedTuple):
     actions: np.ndarray
 
 
+class ReplayBufferSamples(NamedTuple):
+    observations: np.ndarray
+    actions: np.ndarray
+    next_observations: np.ndarray
+    dones: np.ndarray
+    rewards: np.ndarray
+
+
 class BaseBuffer(ABC):
     def __init__(
         self,
@@ -43,8 +51,13 @@ class BaseBuffer(ABC):
         self.observation_dim = observation_dim
         self.action_dim = action_dim
 
+    @abstractmethod
     def sample(self, batch_size: int):
-        pass
+        raise NotImplementedError
+
+    @abstractmethod
+    def reset(self):
+        raise NotImplementedError
 
 
 class TrajectoryBuffer(BaseBuffer):
@@ -85,9 +98,9 @@ class TrajectoryBuffer(BaseBuffer):
         self.terminal_traj = None
         self.traj_lengths = None
 
-        self._reset()
+        self.reset()
 
-    def _reset(self):
+    def reset(self):
         self.observation_traj = np.zeros((self.buffer_size, self.max_traj_len, self.observation_dim))
         self.action_traj = np.zeros((self.buffer_size, self.max_traj_len, self.action_dim))
         self.reward_traj = np.zeros((self.buffer_size, self.max_traj_len))
@@ -315,6 +328,82 @@ class TrajectoryBuffer(BaseBuffer):
         history = jnp.concatenate((history, history_marker), axis=2)
 
         return history
+
+
+class ReplayBuffer(BaseBuffer):
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_dim: int,
+        action_dim: int,
+        normalize_factor: float
+    ):
+        super(ReplayBuffer, self).__init__(
+            buffer_size=buffer_size,
+            observation_dim=observation_dim,
+            action_dim=action_dim
+        )
+        self.normalize_factor = normalize_factor
+
+        self.observations = None
+        self.next_observations = None
+        self.actions = None
+        self.rewards = None
+        self.dones = None
+
+        self.pos = None
+        self.full = None
+
+    def _normalize_obs(self, observations: np.ndarray) -> np.ndarray:
+        return observations / self.normalize_factor
+
+    def reset(self):
+        self.observations = np.zeros((self.buffer_size, self.observation_dim))
+        self.next_observations = np.zeros((self.buffer_size, self.observation_dim))
+        self.actions = np.zeros((self.buffer_size, self.action_dim))
+        self.rewards = np.zeros((self.buffer_size,))
+        self.dones = np.zeros((self.buffer_size,))
+
+        self.pos = 0
+        self.full = False
+
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        done: np.ndarray,
+    ):
+        # Copy to avoid modification by reference
+        self.observations[self.pos] = np.array(obs).copy()
+        self.next_observations[self.pos] = np.array(next_obs).copy()
+        self.actions[self.pos] = np.array(action).copy()
+        self.rewards[self.pos] = np.array(reward).copy()
+        self.dones[self.pos] = np.array(done).copy()
+
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+            self.pos = 0
+
+    def sample(self, batch_size: int) -> ReplayBufferSamples:
+        if self.full:
+            batch_inds = (np.random.randint(1, self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
+        else:
+            batch_inds = np.random.randint(0, self.pos, size=batch_size)
+        return self._get_samples(batch_inds)
+
+    def _get_samples(self, batch_inds: np.ndarray) -> ReplayBufferSamples:
+        data = (
+            self._normalize_obs(self.observations[batch_inds, :]),      # Obs
+            self.actions[batch_inds, :],                                # Act
+            self._normalize_obs(self.next_observations[batch_inds, :]), # Next obs
+            self.dones[batch_inds],
+            self.rewards[batch_inds]
+        )
+
+        return ReplayBufferSamples(*data)
 
 
 if __name__ == "__main__":

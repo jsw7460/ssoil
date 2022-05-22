@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-from buffer import TrajectoryBuffer
+from buffer import TrajectoryBuffer, ReplayBuffer
 from misc import get_sa_dim
 from save_utils import save_to_zip_file, load_from_zip_file, recursive_getattr, recursive_setattr
 
@@ -42,6 +42,7 @@ class Deli(object):
         self.tensorboard_log = tensorboard_log
         self.expert_goal = expert_goal
 
+        self._writer = None
         if tensorboard_log is not None:
             self._writer = SummaryWriter(log_dir=self.tensorboard_log)
 
@@ -49,6 +50,8 @@ class Deli(object):
         self.n_updates = 0
         self.num_timesteps = 0
         self.diagnostics = defaultdict(list)
+
+        self.init_online = False
 
     def load_data(self, data_path: str, use_jax: bool = False):
         self.replay_buffer = TrajectoryBuffer(
@@ -110,7 +113,7 @@ class Deli(object):
     def train(self, batch_size: int):
         pass
 
-    def learn(self, total_timesteps: int, batch_size: int = 256):
+    def offline_learn(self, total_timesteps: int, batch_size: int = 256):
         self.diagnostics = defaultdict(list)
         self.offline_rounds += 1
         for _ in range(total_timesteps):
@@ -118,6 +121,17 @@ class Deli(object):
             for k, v in train_infos.items():
                 if "loss" in k:
                     self.diagnostics["loss/"+k].append(v)
+
+    def _setup_online_learn(self):
+        if self.init_online:
+            self.replay_buffer = ReplayBuffer(
+                buffer_size=1_000_000
+            )
+        else:
+            return
+
+    def online_learn(self, total_timesteps: int, batch_size: int = 256):
+        self._setup_online_learn()
 
     @abstractmethod
     def get_save_params(self):

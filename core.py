@@ -113,6 +113,7 @@ def _update_mse_jit(
         deterministic=True,
         rngs={"dropout": dropout_key, "decoder": decoder_key, "noise": noise_key},
     )
+    _, history_latent, *_ = ae(ae_input, deterministic=True, rngs={"dropout": dropout_key, "decoder": decoder_key, "noise": noise_key})
 
     # Note Start: 3. Actor train
     rng, key = jax.random.split(rng)

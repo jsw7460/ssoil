@@ -21,7 +21,6 @@ from misc import get_sa_dim, DeliFeaturesExtractor
 Params = flax.core.FrozenDict[str, Any]
 
 
-
 class Deli(object):
     def __init__(
         self,
